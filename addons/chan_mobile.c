@@ -53,6 +53,7 @@
 #include <bluetooth/rfcomm.h>
 #include <bluetooth/sco.h>
 #include <bluetooth/l2cap.h>
+#include <sbc/sbc.h>
 
 #include "asterisk/compat.h"
 #include "asterisk/lock.h"
@@ -80,7 +81,30 @@
 
 #define DEVICE_FRAME_SIZE 48
 #define DEVICE_FRAME_FORMAT ast_format_slin
-#define CHANNEL_FRAME_SIZE 80
+#define CHANNEL_FRAME_SIZE 320
+
+/* mSBC (HFP wideband, codec 2) framing constants. Each on-air packet is a
+ * 60-byte H2-framed mSBC frame: 2 byte H2 header + 57 byte mSBC payload +
+ * 1 byte padding. One mSBC frame decodes to 240 bytes (120 samples) of
+ * 16 kHz signed-linear (slin16) PCM, i.e. 7.5 ms of audio. */
+#define MSBC_FRAME_FORMAT	ast_format_slin16
+#define MSBC_FRAME_LEN		60	/* on-air H2 frame length */
+#define MSBC_PAYLOAD_LEN	57	/* mSBC payload within the frame */
+#define MSBC_PCM_LEN		240	/* decoded PCM bytes per frame (slin16) */
+#define MSBC_FRAME_SAMPLES	120	/* slin16 samples per decoded mSBC frame */
+
+/* RX clock-drift compensation thresholds (in slin16 samples, 16 kHz).
+ * Correct by at most one mSBC frame (7.5 ms) once the accumulated skew
+ * between the BT SCO clock and wall clock exceeds the threshold. A generous
+ * threshold gives hysteresis so normal jitter never triggers a correction;
+ * at typical SCO drift a single inaudible 7.5 ms drop/repeat occurs every
+ * minute or two. */
+#define MSBC_DRIFT_THRESHOLD	480	/* 30 ms of skew: start looking for a quiet frame to correct on */
+#define MSBC_DRIFT_THRESHOLD_HARD 960	/* 60 ms of skew: correct now regardless of audio content */
+#define MSBC_DRIFT_QUIET_PEAK	1500	/* slin16 peak below which a 7.5 ms drop/repeat is inaudible */
+
+/* H2 header second byte sequence-number table (see HFP 1.6 / mSBC framing). */
+static const uint8_t msbc_sntable[4] = { 0x08, 0x38, 0xC8, 0xF8 };
 
 static int discovery_interval = 60;			/* The device discovery interval, default 60 seconds. */
 static pthread_t discovery_thread = AST_PTHREADT_NULL;	/* The discovery thread */
@@ -103,6 +127,7 @@ struct adapter_pvt {
 	bdaddr_t addr;					/* adddress of adapter */
 	unsigned int inuse:1;				/* are we in use ? */
 	unsigned int alignment_detection:1;		/* do alignment detection on this adapter? */
+	unsigned int defer_setup:1;			/*!< BT_DEFER_SETUP enabled on sco listener (for mSBC air-mode config) */
 	struct io_context *io;				/*!< io context for audio connections */
 	struct io_context *accept_io;			/*!< io context for sco listener */
 	int *sco_id;					/*!< the io context id of the sco listener socket */
@@ -135,6 +160,33 @@ struct mbl_pvt {
 	struct ast_smoother *bt_out_smoother;			/* our bt_out_smoother, for making 48 byte frames */
 	struct ast_smoother *bt_in_smoother;			/* our smoother, for making "normal" CHANNEL_FRAME_SIZEed byte frames */
 	int sco_socket;					/* sco socket descriptor */
+
+	/* mSBC (wideband) state, used when hfp->codec == HFP_CODEC_MSBC */
+	unsigned int msbc_active:1;			/*!< whether the current SCO link uses mSBC */
+	unsigned int msbc_inited:1;			/*!< whether the sbc encoder/decoder are initialized */
+	sbc_t msbc_enc;					/*!< libsbc context for encoding (slin16 -> mSBC) */
+	sbc_t msbc_dec;					/*!< libsbc context for decoding (mSBC -> slin16); must be separate from the encoder, the sbc_t state is per-direction */
+	uint8_t msbc_enc_seq;				/*!< outgoing H2 sequence number (0..3) */
+	uint8_t msbc_rx[MSBC_FRAME_LEN];		/*!< reassembly buffer for an incoming H2 frame */
+	int msbc_rx_pos;				/*!< current fill position in msbc_rx */
+	uint8_t msbc_rxpcm[MSBC_PCM_LEN * 12 + AST_FRIENDLY_OFFSET];	/*!< decoded slin16 accumulated while draining the SCO socket in one read */
+	uint8_t msbc_pcm[MSBC_PCM_LEN];			/*!< pending outgoing PCM not yet making a full mSBC frame */
+	int msbc_pcm_len;				/*!< bytes valid in msbc_pcm */
+	uint8_t msbc_tx[MSBC_FRAME_LEN * 16];		/*!< ring of encoded mSBC bytes awaiting transmit; drained one SCO packet per received RX packet so TX is paced to the eSCO air clock rather than the bursty PBX write thread */
+	int msbc_tx_len;				/*!< bytes valid in msbc_tx */
+	int sco_mtu;					/*!< SCO link MTU (write packet size) */
+	unsigned int sco_pkt;				/*!< observed SCO air-frame size (from RX read length); TX must write fixed packets of this size so the mSBC stream is framed exactly as the receiver expects */
+	/* RX clock-drift compensation: the SCO link runs on the Bluetooth
+	 * controller's clock, which differs slightly from the system/RTP clock.
+	 * Over a long call the difference accumulates and the far SIP endpoint's
+	 * jitter buffer over/underflows (progressive breakup). We track samples
+	 * produced from BT against wall-clock-expected samples and drop or repeat
+	 * one mSBC frame when the skew exceeds a threshold, keeping RX aligned to
+	 * real time. */
+	struct timeval msbc_rx_t0;			/*!< wall-clock reference set on the first decoded frame */
+	unsigned int msbc_rx_t0_set:1;			/*!< whether msbc_rx_t0 has been initialized this call */
+	long msbc_rx_samples;				/*!< slin16 samples delivered to the smoother since msbc_rx_t0 */
+	int16_t wb_buf[1024 + AST_FRIENDLY_OFFSET / 2];	/*!< slin16 staging for the narrowband (CVSD) resample path */
 	pthread_t monitor_thread;			/* monitor thread handle */
 	int timeout;					/*!< used to set the timeout for rfcomm data (may be used in the future) */
 	unsigned int no_callsetup:1;
@@ -172,6 +224,7 @@ struct cidinfo {
 static AST_RWLIST_HEAD_STATIC(devices, mbl_pvt);
 
 static int handle_response_ok(struct mbl_pvt *pvt, char *buf);
+static int handle_response_bcs(struct mbl_pvt *pvt, char *buf);
 static int handle_response_error(struct mbl_pvt *pvt, char *buf);
 static int handle_response_ciev(struct mbl_pvt *pvt, char *buf);
 static int handle_response_clip(struct mbl_pvt *pvt, char *buf);
@@ -261,6 +314,7 @@ static int headset_send_ring(const void *data);
 #define HFP_HF_VOLUME	(1 << 4)
 #define HFP_HF_STATUS	(1 << 5)
 #define HFP_HF_CONTROL	(1 << 6)
+#define HFP_HF_CODEC	(1 << 7)	/*!< codec negotiation (HFP 1.6) */
 
 #define HFP_AG_CW	(1 << 0)
 #define HFP_AG_ECNR	(1 << 1)
@@ -271,6 +325,11 @@ static int headset_send_ring(const void *data);
 #define HFP_AG_STATUS	(1 << 6)
 #define HFP_AG_CONTROL	(1 << 7)
 #define HFP_AG_ERRORS	(1 << 8)
+#define HFP_AG_CODEC	(1 << 9)	/*!< codec negotiation (HFP 1.6) */
+
+/* HFP codec ids, as used by AT+BAC / +BCS / AT+BCS */
+#define HFP_CODEC_CVSD	1
+#define HFP_CODEC_MSBC	2
 
 #define HFP_CIND_UNKNOWN	-1
 #define HFP_CIND_NONE		0
@@ -307,6 +366,7 @@ struct hfp_hf {
 	int volume:1;	/*!< remote volume control */
 	int status:1;	/*!< enhanced call status */
 	int control:1;	/*!< enhanced call control*/
+	int codec:1;	/*!< codec negotiation */
 };
 
 /*!
@@ -322,6 +382,7 @@ struct hfp_ag {
 	int status:1;	/*!< enhanced call status */
 	int control:1;	/*!< enhanced call control*/
 	int errors:1;	/*!< extended error result codes*/
+	int codec:1;	/*!< codec negotiation */
 };
 
 /*!
@@ -352,11 +413,12 @@ struct hfp_pvt {
 	int rsock;			/*!< our rfcomm socket */
 	int rport;			/*!< our rfcomm port */
 	int sent_alerting;		/*!< have we sent alerting? */
+	int codec;			/*!< negotiated SCO codec (HFP_CODEC_CVSD/MSBC), 0 = not yet negotiated */
 };
 
 
 /* Our supported features.
- * we only support caller id
+ * we support caller id and codec negotiation (for mSBC wideband audio)
  */
 static struct hfp_hf hfp_our_brsf = {
 	.ecnr = 0,
@@ -366,6 +428,7 @@ static struct hfp_hf hfp_our_brsf = {
 	.volume = 0,
 	.status = 0,
 	.control = 0,
+	.codec = 1,
 };
 
 
@@ -383,6 +446,9 @@ static int hfp_brsf2int(struct hfp_hf *hf);
 static struct hfp_ag *hfp_int2brsf(int brsf, struct hfp_ag *ag);
 
 static int hfp_send_brsf(struct hfp_pvt *hfp, struct hfp_hf *brsf);
+static int hfp_send_bac(struct hfp_pvt *hfp);
+static int hfp_send_bcs(struct hfp_pvt *hfp, int codec);
+static int hfp_parse_bcs(struct hfp_pvt *hfp, char *buf);
 static int hfp_send_cind(struct hfp_pvt *hfp);
 static int hfp_send_cind_test(struct hfp_pvt *hfp);
 static int hfp_send_cmer(struct hfp_pvt *hfp, int status);
@@ -451,6 +517,8 @@ typedef enum {
 	AT_NO_DIALTONE,
 	AT_NO_CARRIER,
 	AT_ECAM,
+	AT_BAC,
+	AT_BCS,
 } at_message_t;
 
 static int at_match_prefix(char *buf, char *prefix);
@@ -871,11 +939,32 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
 	}
 
 	ast_channel_tech_set(chn, &mbl_tech);
-	ast_channel_nativeformats_set(chn, mbl_tech.capabilities);
-	ast_channel_set_rawreadformat(chn, DEVICE_FRAME_FORMAT);
-	ast_channel_set_rawwriteformat(chn, DEVICE_FRAME_FORMAT);
-	ast_channel_set_writeformat(chn, DEVICE_FRAME_FORMAT);
-	ast_channel_set_readformat(chn, DEVICE_FRAME_FORMAT);
+	/* The channel is native 16 kHz (slin16): HFP calls normally negotiate the
+	 * mSBC wideband codec, which decodes directly to slin16. When a call falls
+	 * back to CVSD (8 kHz) the audio path resamples to/from slin16, so the
+	 * channel format stays constant for the lifetime of the call.
+	 *
+	 * Advertise ONLY slin16 as the native format. mbl_tech.capabilities also
+	 * lists slin (8 kHz) so that mbl_request() can be matched by narrowband
+	 * callers, but if the channel presented slin as native too, Asterisk would
+	 * pick 8 kHz for an 8 kHz peer (e.g. a G.711 leg or an 8 kHz prompt) and
+	 * hand mbl_write() slin frames -- which the mSBC encoder would then misread
+	 * as 16 kHz, producing half-rate, garbled, under-rate audio. Forcing slin16
+	 * native makes the core resample everything to 16 kHz before mbl_write(). */
+	{
+		struct ast_format_cap *native = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
+		if (native) {
+			ast_format_cap_append(native, MSBC_FRAME_FORMAT, 0);
+			ast_channel_nativeformats_set(chn, native);
+			ao2_ref(native, -1);
+		} else {
+			ast_channel_nativeformats_set(chn, mbl_tech.capabilities);
+		}
+	}
+	ast_channel_set_rawreadformat(chn, MSBC_FRAME_FORMAT);
+	ast_channel_set_rawwriteformat(chn, MSBC_FRAME_FORMAT);
+	ast_channel_set_writeformat(chn, MSBC_FRAME_FORMAT);
+	ast_channel_set_readformat(chn, MSBC_FRAME_FORMAT);
 	ast_channel_tech_pvt_set(chn, pvt);
 
 	if (state == AST_STATE_RING)
@@ -911,7 +1000,10 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
 		return NULL;
 	}
 
-	if (ast_format_cap_iscompatible_format(cap, DEVICE_FRAME_FORMAT) == AST_FORMAT_CMP_NOT_EQUAL) {
+	/* We accept either narrowband slin (CVSD) or wideband slin16 (mSBC); the
+	 * actual SCO codec is negotiated per call and the audio path adapts. */
+	if (ast_format_cap_iscompatible_format(cap, DEVICE_FRAME_FORMAT) == AST_FORMAT_CMP_NOT_EQUAL
+			&& ast_format_cap_iscompatible_format(cap, MSBC_FRAME_FORMAT) == AST_FORMAT_CMP_NOT_EQUAL) {
 		struct ast_str *codec_buf = ast_str_alloca(AST_FORMAT_CAP_NAMES_LEN);
 		ast_log(LOG_WARNING, "Asked to get a channel of unsupported format '%s'\n", ast_format_cap_get_names(cap, &codec_buf));
 		*cause = AST_CAUSE_FACILITY_NOT_IMPLEMENTED;
@@ -1106,6 +1198,292 @@ static int mbl_digit_end(struct ast_channel *ast, char digit, unsigned int durat
 	return 0;
 }
 
+/*!
+ * \brief Drain queued mSBC bytes to the SCO socket without blocking.
+ * \note Called with pvt->lock held.
+ *
+ * Writes whole sco_pkt-sized packets from the msbc_tx ring until the kernel SCO
+ * send buffer is full (send() returns EAGAIN) or fewer than one packet remains.
+ * The kernel buffers a handful of SCO packets (see "SCO MTU: N:count") and
+ * drains them onto the USB isochronous endpoint on the controller's clock, one
+ * fixed-size packet per air slot. Our job is only to keep that buffer topped up;
+ * the hardware provides the precise 3 ms pacing. MSG_DONTWAIT is essential: a
+ * blocking write here would stall the caller (and, from the read path, hold off
+ * RX draining) until the next air slot, wrecking the timing it is meant to keep.
+ */
+static void mbl_msbc_tx_flush(struct mbl_pvt *pvt)
+{
+	unsigned int chunk = pvt->sco_pkt;
+
+	if (!chunk || pvt->sco_socket == -1) {
+		return;
+	}
+	while (pvt->msbc_tx_len >= (int) chunk) {
+		ssize_t w = send(pvt->sco_socket, pvt->msbc_tx, chunk, MSG_DONTWAIT);
+		if (w < 0) {
+			/* EAGAIN: send buffer full -- the hardware has not drained a slot
+			 * yet. Leave the bytes queued and try again on the next call. */
+			break;
+		}
+		pvt->msbc_tx_len -= chunk;
+		memmove(pvt->msbc_tx, pvt->msbc_tx + chunk, pvt->msbc_tx_len);
+	}
+}
+
+/*!
+ * \brief Read and decode one SCO packet of mSBC (wideband) audio.
+ * \note Called with pvt->lock held. Returns a slin16 voice frame, or the null
+ * frame if this packet did not complete an mSBC frame. On a fatal socket error
+ * the SCO socket is torn down (mirroring the narrowband path).
+ *
+ * The incoming byte stream is H2 framed: each 60 byte frame is
+ * [0x01][sn][57 byte mSBC payload][pad]. We resynchronise byte by byte (the
+ * SCO MTU does not necessarily align to frame boundaries) and decode each
+ * completed frame to 240 bytes of slin16 PCM.
+ */
+static struct ast_frame *mbl_msbc_read(struct mbl_pvt *pvt, struct ast_channel *ast)
+{
+	uint8_t pkt[256];
+	struct ast_frame *fr = NULL;
+	struct ast_frame feed;
+	uint8_t pcm[MSBC_PCM_LEN];
+	int r, i;
+
+	/* Same structure as the narrowband path: read SCO packets and decode each
+	 * completed mSBC frame, feeding the resulting slin16 into a smoother, and
+	 * loop until the smoother yields a regular fixed-size frame. This paces to
+	 * the SCO clock (the read blocks/​returns per packet) and hands the bridge
+	 * evenly-sized frames, which avoids the timing jitter that irregular
+	 * per-packet delivery caused (audible breakup). */
+	do {
+		if ((r = read(pvt->sco_socket, pkt, sizeof(pkt))) == -1) {
+			if (errno != EAGAIN && errno != EINTR) {
+				ast_debug(1, "[%s] read error %d, going to wait for new connection\n", pvt->id, errno);
+				close(pvt->sco_socket);
+				pvt->sco_socket = -1;
+				ast_channel_set_fd(ast, 0, -1);
+			}
+			return &ast_null_frame;
+		}
+
+		/* Learn the SCO air-frame size from the actual RX packet length (SCO is
+		 * SOCK_SEQPACKET, so each read is exactly one on-air packet). The eSCO
+		 * link can use a packet smaller than an mSBC frame (e.g. 24 bytes); the
+		 * TX path uses this to write fixed-size packets so its mSBC stream is
+		 * framed the same way this RX side expects. */
+		if (r > 0 && r <= 64 && (pvt->sco_pkt == 0 || (unsigned int) r < pvt->sco_pkt)) {
+			ast_debug(1, "[%s] mSBC SCO air-frame size learned/updated: %d bytes (was %u)\n", pvt->id, r, pvt->sco_pkt);
+			pvt->sco_pkt = r;
+		}
+
+		/* Keep the SCO send buffer topped up. We are here because an RX packet
+		 * arrived, i.e. the hardware just serviced an air slot and very likely
+		 * freed a TX slot too; this is the natural, clock-aligned moment to push
+		 * more outgoing audio. The flush is non-blocking, so draining RX is never
+		 * held up by TX. The encoded bytes were queued by mbl_msbc_write. */
+		mbl_msbc_tx_flush(pvt);
+
+		/* Drop bogus all-zero packets some controllers insert on missed slots;
+		 * feeding them into the framer corrupts the frame and causes clicks. */
+		{
+			int allzero = 1, z;
+			for (z = 0; z < r; z++) {
+				if (pkt[z]) { allzero = 0; break; }
+			}
+			if (allzero) {
+				fr = ast_smoother_read(pvt->bt_in_smoother);
+				continue;
+			}
+		}
+
+		for (i = 0; i < r; i++) {
+			uint8_t byte = pkt[i];
+
+			/* H2 / mSBC frame synchronisation state machine. */
+			switch (pvt->msbc_rx_pos) {
+			case 0:
+				if (byte != 0x01) { pvt->msbc_rx_pos = 0; continue; }
+				break;
+			case 1:
+				if (!((byte & 0x0F) == 0x08 &&
+				      ((byte >> 4) & 1) == ((byte >> 5) & 1) &&
+				      ((byte >> 6) & 1) == ((byte >> 7) & 1))) {
+					pvt->msbc_rx_pos = 0; continue;
+				}
+				break;
+			case 2:
+				if (byte != 0xAD) { pvt->msbc_rx_pos = 0; continue; }
+				break;
+			case 3:
+			case 4:
+				if (byte != 0x00) { pvt->msbc_rx_pos = 0; continue; }
+				break;
+			default:
+				break;
+			}
+
+			pvt->msbc_rx[pvt->msbc_rx_pos++] = byte;
+
+			if (pvt->msbc_rx_pos >= MSBC_FRAME_LEN) {
+				size_t written = 0;
+				ssize_t processed;
+				long skew;
+
+				pvt->msbc_rx_pos = 0;
+
+				processed = sbc_decode(&pvt->msbc_dec, pvt->msbc_rx + 2, MSBC_PAYLOAD_LEN,
+						pcm, sizeof(pcm), &written);
+				if (processed < 0) {
+					ast_debug(1, "[%s] sbc_decode failed: %d\n", pvt->id, (int) processed);
+					continue;
+				}
+
+				memset(&feed, 0x00, sizeof(feed));
+				feed.frametype = AST_FRAME_VOICE;
+				feed.subclass.format = MSBC_FRAME_FORMAT;
+				feed.src = "Mobile";
+				feed.data.ptr = pcm;
+				feed.datalen = (int) written;
+				feed.samples = (int) written / 2;
+
+				/* Clock-drift compensation against wall clock. skew > 0 means
+				 * BT has produced more audio than real time expects (BT clock
+				 * fast); skew < 0 means it is behind. The SCO link runs ~hundreds
+				 * of ppm off the system clock, so a correction is unavoidable;
+				 * the trick is to make it inaudible.
+				 *
+				 * A drop/repeat of a 7.5 ms frame is only audible mid-speech, so
+				 * we hide it: once the skew passes the soft threshold we wait for
+				 * a low-energy (near-silent) frame -- a pause between words -- and
+				 * correct there, where a duplicated/missing 7.5 ms cannot be heard.
+				 * A hard threshold bounds how long we defer, forcing a correction
+				 * even mid-speech if the talker never pauses (rare, and a single
+				 * glitch then beats unbounded latency drift). */
+				if (!pvt->msbc_rx_t0_set) {
+					pvt->msbc_rx_t0 = ast_tvnow();
+					pvt->msbc_rx_samples = 0;
+					pvt->msbc_rx_t0_set = 1;
+				}
+				skew = pvt->msbc_rx_samples -
+					(long)(ast_tvdiff_ms(ast_tvnow(), pvt->msbc_rx_t0) * 16);
+
+				{
+					/* Peak amplitude of this frame, to tell speech from a pause. */
+					int16_t *s = (int16_t *) pcm;
+					int ns = (int) (written / 2), si, peak = 0;
+					int quiet, hard;
+					for (si = 0; si < ns; si++) {
+						int a = s[si] < 0 ? -s[si] : s[si];
+						if (a > peak) { peak = a; }
+					}
+					quiet = peak < MSBC_DRIFT_QUIET_PEAK;
+
+					hard = (skew > MSBC_DRIFT_THRESHOLD_HARD) || (skew < -MSBC_DRIFT_THRESHOLD_HARD);
+
+					if (skew > MSBC_DRIFT_THRESHOLD && (quiet || hard)) {
+						/* Ahead of real time: drop this frame to catch down. */
+						ast_debug(2, "[%s] mSBC RX drift +%ldms, dropping a frame (peak %d%s)\n",
+							pvt->id, skew / 16, peak, hard ? ", hard" : "");
+						continue;
+					}
+
+					ast_smoother_feed(pvt->bt_in_smoother, &feed);
+					pvt->msbc_rx_samples += MSBC_FRAME_SAMPLES;
+
+					if (skew < -MSBC_DRIFT_THRESHOLD && (quiet || hard)) {
+						/* Behind real time: repeat this frame to pad the gap. */
+						ast_debug(2, "[%s] mSBC RX drift %ldms, repeating a frame (peak %d%s)\n",
+							pvt->id, skew / 16, peak, hard ? ", hard" : "");
+						ast_smoother_feed(pvt->bt_in_smoother, &feed);
+						pvt->msbc_rx_samples += MSBC_FRAME_SAMPLES;
+					}
+				}
+			}
+		}
+
+		fr = ast_smoother_read(pvt->bt_in_smoother);
+	} while (fr == NULL);
+
+	fr = ast_dsp_process(ast, pvt->dsp, fr);
+
+	return fr;
+}
+
+/*!
+ * \brief Encode slin16 audio to mSBC and write it to the SCO socket.
+ * \note Called with pvt->lock held. The frame data is 16 kHz signed linear.
+ *
+ * PCM is accumulated into 240 byte (120 sample) units; each unit is SBC
+ * encoded into a 57 byte payload, wrapped in a 60 byte H2 frame, and queued in
+ * the msbc_tx ring. The frames are not written here: mbl_msbc_read drains the
+ * ring one SCO packet per received RX packet, pacing TX to the eSCO air clock.
+ */
+static void mbl_msbc_write(struct mbl_pvt *pvt, struct ast_frame *frame)
+{
+	uint8_t *in = frame->data.ptr;
+	int in_len = frame->datalen;
+	int off = 0;
+
+	while (in_len > 0) {
+		int need = MSBC_PCM_LEN - pvt->msbc_pcm_len;
+		int take = (in_len < need) ? in_len : need;
+
+		memcpy(pvt->msbc_pcm + pvt->msbc_pcm_len, in + off, take);
+		pvt->msbc_pcm_len += take;
+		off += take;
+		in_len -= take;
+
+		if (pvt->msbc_pcm_len < MSBC_PCM_LEN) {
+			break;
+		}
+
+		/* Encode one 60-byte mSBC H2 frame and append it to the TX ring. The
+		 * actual transmission happens in mbl_msbc_read, which sends exactly one
+		 * SCO packet for every RX packet it consumes.
+		 *
+		 * This pacing is the crucial part on USB SCO adapters: the controller's
+		 * isochronous endpoint requires a fixed-size packet delivered on every
+		 * air interval (e.g. 24 bytes every 3 ms), and it is a hard rate, not a
+		 * maximum -- deliver late or in bursts and the stream underruns and the
+		 * far end garbles. The PBX write thread hands us audio in ~20 ms bursts,
+		 * far too lumpy to feed the link directly. RX and TX share the one eSCO
+		 * clock, so draining one TX packet per received RX packet paces TX to
+		 * exactly the air rate. The ring absorbs the burstiness in between. */
+		{
+			ssize_t out_encoded = 0;
+			uint8_t frame[MSBC_FRAME_LEN];
+
+			frame[0] = 0x01;
+			frame[1] = msbc_sntable[pvt->msbc_enc_seq % 4];
+			frame[MSBC_FRAME_LEN - 1] = 0x00;
+			pvt->msbc_enc_seq = (pvt->msbc_enc_seq + 1) % 4;
+
+			if (sbc_encode(&pvt->msbc_enc, pvt->msbc_pcm, MSBC_PCM_LEN,
+					frame + 2, MSBC_PAYLOAD_LEN, &out_encoded) >= 0) {
+				if (pvt->msbc_tx_len + MSBC_FRAME_LEN > (int) sizeof(pvt->msbc_tx)) {
+					/* Ring full: the reader is draining slower than we fill
+					 * (clock skew over a long call). Drop the oldest frame to
+					 * bound latency; the receiver re-syncs on the next H2 header. */
+					int drop = MSBC_FRAME_LEN;
+					pvt->msbc_tx_len -= drop;
+					memmove(pvt->msbc_tx, pvt->msbc_tx + drop, pvt->msbc_tx_len);
+					ast_debug(2, "[%s] mSBC TX ring full, dropped oldest frame\n", pvt->id);
+				}
+				memcpy(pvt->msbc_tx + pvt->msbc_tx_len, frame, MSBC_FRAME_LEN);
+				pvt->msbc_tx_len += MSBC_FRAME_LEN;
+			} else {
+				ast_debug(1, "[%s] sbc_encode failed\n", pvt->id);
+			}
+		}
+		pvt->msbc_pcm_len = 0;
+	}
+
+	/* Top up the SCO send buffer with what we just queued (non-blocking). The
+	 * read path does the same on the RX clock; doing it here too keeps the
+	 * buffer fed at call start and whenever RX is momentarily quiet. */
+	mbl_msbc_tx_flush(pvt);
+}
+
 static struct ast_frame *mbl_read(struct ast_channel *ast)
 {
 
@@ -1123,18 +1501,23 @@ static struct ast_frame *mbl_read(struct ast_channel *ast)
 		goto e_return;
 	}
 
-	memset(&pvt->fr, 0x00, sizeof(struct ast_frame));
-	pvt->fr.frametype = AST_FRAME_VOICE;
-	pvt->fr.subclass.format = DEVICE_FRAME_FORMAT;
-	pvt->fr.src = "Mobile";
-	pvt->fr.offset = AST_FRIENDLY_OFFSET;
-	pvt->fr.mallocd = 0;
-	pvt->fr.delivery.tv_sec = 0;
-	pvt->fr.delivery.tv_usec = 0;
-	pvt->fr.data.ptr = pvt->io_buf + AST_FRIENDLY_OFFSET;
+	if (pvt->msbc_active) {
+		fr = mbl_msbc_read(pvt, ast);
+		if (fr != &ast_null_frame) {
+			fr = ast_dsp_process(ast, pvt->dsp, fr);
+		}
+		ast_mutex_unlock(&pvt->lock);
+		return fr;
+	}
 
-	do {
-		if ((r = read(pvt->sco_socket, pvt->fr.data.ptr, DEVICE_FRAME_SIZE)) == -1) {
+	/* Narrowband (CVSD) path: the SCO link carries 8 kHz signed-linear audio.
+	 * The channel is slin16, so upsample (x2, sample doubling) to 16 kHz. */
+	{
+		int16_t in8[512];
+		int16_t *out = pvt->wb_buf + AST_FRIENDLY_OFFSET / 2;
+		int nsamp, i;
+
+		if ((r = read(pvt->sco_socket, in8, sizeof(in8))) == -1) {
 			if (errno != EAGAIN && errno != EINTR) {
 				ast_debug(1, "[%s] read error %d, going to wait for new connection\n", pvt->id, errno);
 				close(pvt->sco_socket);
@@ -1144,16 +1527,34 @@ static struct ast_frame *mbl_read(struct ast_channel *ast)
 			goto e_return;
 		}
 
-		pvt->fr.datalen = r;
-		pvt->fr.samples = r / 2;
+		nsamp = r / 2;
+		if (nsamp > 1024) {
+			nsamp = 1024;
+		}
+		if (nsamp == 0) {
+			goto e_return;
+		}
 
 		if (pvt->do_alignment_detection)
-			do_alignment_detection(pvt, pvt->fr.data.ptr, r);
+			do_alignment_detection(pvt, (char *) in8, nsamp * 2);
 
-		ast_smoother_feed(pvt->bt_in_smoother, &pvt->fr);
-		fr = ast_smoother_read(pvt->bt_in_smoother);
-	} while (fr == NULL);
-	fr = ast_dsp_process(ast, pvt->dsp, fr);
+		for (i = 0; i < nsamp; i++) {
+			out[2 * i] = in8[i];
+			out[2 * i + 1] = in8[i];
+		}
+
+		memset(&pvt->fr, 0x00, sizeof(struct ast_frame));
+		pvt->fr.frametype = AST_FRAME_VOICE;
+		pvt->fr.subclass.format = MSBC_FRAME_FORMAT;
+		pvt->fr.src = "Mobile";
+		pvt->fr.offset = AST_FRIENDLY_OFFSET;
+		pvt->fr.mallocd = 0;
+		pvt->fr.data.ptr = out;
+		pvt->fr.datalen = nsamp * 4;
+		pvt->fr.samples = nsamp * 2;
+
+		fr = ast_dsp_process(ast, pvt->dsp, &pvt->fr);
+	}
 
 	ast_mutex_unlock(&pvt->lock);
 
@@ -1168,7 +1569,6 @@ static int mbl_write(struct ast_channel *ast, struct ast_frame *frame)
 {
 
 	struct mbl_pvt *pvt = ast_channel_tech_pvt(ast);
-	struct ast_frame *f;
 
 	ast_debug(3, "*** mbl_write\n");
 
@@ -1180,10 +1580,35 @@ static int mbl_write(struct ast_channel *ast, struct ast_frame *frame)
 		CHANNEL_DEADLOCK_AVOIDANCE(ast);
 	}
 
-	ast_smoother_feed(pvt->bt_out_smoother, frame);
+	if (pvt->msbc_active) {
+		mbl_msbc_write(pvt, frame);
+		ast_mutex_unlock(&pvt->lock);
+		return 0;
+	}
 
-	while ((f = ast_smoother_read(pvt->bt_out_smoother))) {
-		sco_write(pvt->sco_socket, f->data.ptr, f->datalen);
+	/* Narrowband (CVSD) path: the channel is slin16; downsample (drop every
+	 * other sample) to 8 kHz and write to the SCO link in DEVICE_FRAME_SIZE
+	 * sized packets. */
+	{
+		int16_t *in16 = frame->data.ptr;
+		int insamp = frame->datalen / 2;
+		int16_t out8[512];
+		int o = 0, i, off = 0;
+
+		for (i = 0; i + 1 < insamp && o < (int) (sizeof(out8) / sizeof(out8[0])); i += 2) {
+			out8[o++] = in16[i];
+		}
+
+		while (off < o * 2) {
+			int chunk = o * 2 - off;
+			if (chunk > DEVICE_FRAME_SIZE) {
+				chunk = DEVICE_FRAME_SIZE;
+			}
+			if (!sco_write(pvt->sco_socket, (char *) out8 + off, chunk)) {
+				break;
+			}
+			off += chunk;
+		}
 	}
 
 	ast_mutex_unlock(&pvt->lock);
@@ -1830,6 +2255,45 @@ static ssize_t rfcomm_read(int rsock, char *buf, size_t count)
 
 */
 
+/*!
+ * \brief Prepare per-call mSBC codec state on the given pvt.
+ *
+ * Initializes (once) the libsbc context for mSBC and resets the framing state
+ * for a new audio connection. Marks the pvt as using mSBC so the audio path
+ * (mbl_read/mbl_write) does H2 framing and SBC transcoding against 16 kHz
+ * signed-linear (slin16). Must be called with pvt->lock held (or before the
+ * pvt is visible to the audio path).
+ */
+static void mbl_msbc_activate(struct mbl_pvt *pvt)
+{
+	if (!pvt->msbc_inited) {
+		sbc_init_msbc(&pvt->msbc_enc, 0);
+		pvt->msbc_enc.endian = SBC_LE;
+		sbc_init_msbc(&pvt->msbc_dec, 0);
+		pvt->msbc_dec.endian = SBC_LE;
+		pvt->msbc_inited = 1;
+	}
+	pvt->msbc_enc_seq = 0;
+	pvt->msbc_rx_pos = 0;
+	pvt->msbc_pcm_len = 0;
+	pvt->msbc_tx_len = 0;
+	pvt->sco_pkt = 0;
+	pvt->msbc_rx_t0_set = 0;
+	pvt->msbc_rx_samples = 0;
+	pvt->msbc_active = 1;
+}
+
+/*!
+ * \brief Tear down per-call mSBC state (called when the SCO link goes away).
+ */
+static void mbl_msbc_deactivate(struct mbl_pvt *pvt)
+{
+	pvt->msbc_active = 0;
+	pvt->msbc_rx_pos = 0;
+	pvt->msbc_pcm_len = 0;
+	pvt->msbc_tx_len = 0;
+}
+
 static int sco_connect(bdaddr_t src, bdaddr_t dst)
 {
 
@@ -1912,11 +2376,7 @@ static int sco_accept(int *id, int fd, short events, void *data)
 		return 0;
 	}
 
-	len = sizeof(so);
-	getsockopt(sock, SOL_SCO, SCO_OPTIONS, &so, &len);
-
 	ba2str(&addr.sco_bdaddr, saddr);
-	ast_debug(1, "Incoming Audio Connection from device %s MTU is %d\n", saddr, so.mtu);
 
 	/* figure out which device this sco connection belongs to */
 	pvt = NULL;
@@ -1932,10 +2392,52 @@ static int sco_accept(int *id, int fd, short events, void *data)
 		return 1;
 	}
 
+	/* With deferred setup the connection is not yet established: configure the
+	 * air mode for the negotiated codec (transparent for mSBC) and then trigger
+	 * the effective setup with a first (zero length) read. */
+	if (adapter->defer_setup) {
+		if (pvt->hfp->codec == HFP_CODEC_MSBC) {
+			struct bt_voice voice_config;
+			memset(&voice_config, 0, sizeof(voice_config));
+			voice_config.setting = BT_VOICE_TRANSPARENT;
+			if (setsockopt(sock, SOL_BLUETOOTH, BT_VOICE, &voice_config, sizeof(voice_config)) < 0) {
+				ast_log(LOG_ERROR, "[%s] unable to set transparent air mode for mSBC: %s\n", pvt->id, strerror(errno));
+				close(sock);
+				return 1;
+			}
+			ast_debug(1, "[%s] mSBC: set transparent air mode on incoming SCO\n", pvt->id);
+		}
+		{
+			char b;
+			if (read(sock, &b, 1) == -1) {
+				ast_log(LOG_ERROR, "[%s] unable to authorize/complete SCO setup: %s\n", pvt->id, strerror(errno));
+				close(sock);
+				return 1;
+			}
+		}
+	}
+
+	len = sizeof(so);
+	so.mtu = 0;
+	getsockopt(sock, SOL_SCO, SCO_OPTIONS, &so, &len);
+	ast_debug(1, "Incoming Audio Connection from device %s MTU is %d, codec %d\n", saddr, so.mtu, pvt->hfp->codec);
+
 	ast_mutex_lock(&pvt->lock);
 	if (pvt->sco_socket != -1) {
 		close(pvt->sco_socket);
 		pvt->sco_socket = -1;
+	}
+	/* SCO write packet size. With deferred setup the MTU is often not yet
+	 * known here (reads back as 0); leave it 0 so the audio path re-reads it
+	 * once the link is fully up. */
+	pvt->sco_mtu = (so.mtu > 0) ? so.mtu : 0;
+
+	/* Configure the audio path for the negotiated codec before the socket
+	 * becomes visible to mbl_read/mbl_write. */
+	if (pvt->hfp->codec == HFP_CODEC_MSBC) {
+		mbl_msbc_activate(pvt);
+	} else {
+		mbl_msbc_deactivate(pvt);
 	}
 
 	pvt->sco_socket = sock;
@@ -1975,6 +2477,19 @@ static int sco_bind(struct adapter_pvt *adapter)
 	if (setsockopt(adapter->sco_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
 		ast_log(LOG_ERROR, "Unable to setsockopt sco listener socket.\n");
 		goto e_close_socket;
+	}
+	/* Enable deferred setup so that, when an incoming SCO connection is
+	 * accepted, we can configure the air mode (transparent for mSBC) on the
+	 * accepted socket before the link is actually established. The effective
+	 * setup then completes on the first read of the accepted socket. */
+	{
+		uint32_t defer = 1;
+		if (setsockopt(adapter->sco_socket, SOL_BLUETOOTH, BT_DEFER_SETUP, &defer, sizeof(defer)) < 0) {
+			ast_log(LOG_WARNING, "Unable to enable deferred setup on sco listener for adapter %s; mSBC may not work. (%d)\n", adapter->id, errno);
+			adapter->defer_setup = 0;
+		} else {
+			adapter->defer_setup = 1;
+		}
 	}
 	if (listen(adapter->sco_socket, 5) < 0) {
 		ast_log(LOG_ERROR, "Unable to listen sco listener socket.\n");
@@ -2037,6 +2552,8 @@ static at_message_t at_read_full(int rsock, char *buf, size_t count)
 		return AT_CIEV;
 	} else if (at_match_prefix(buf, "+BRSF:")) {
 		return AT_BRSF;
+	} else if (at_match_prefix(buf, "+BCS:")) {
+		return AT_BCS;
 	} else if (at_match_prefix(buf, "+CIND:")) {
 		return AT_CIND;
 	} else if (at_match_prefix(buf, "+CLIP:")) {
@@ -2142,6 +2659,10 @@ static inline const char *at_msg2str(at_message_t msg)
 		return "AT+CUSD";
 	case AT_ECAM:
 		return "AT*ECAM";
+	case AT_BAC:
+		return "AT+BAC";
+	case AT_BCS:
+		return "+BCS";
 	}
 }
 
@@ -2478,6 +2999,7 @@ static int hfp_brsf2int(struct hfp_hf *hf)
 	brsf |= hf->volume ? HFP_HF_VOLUME : 0;
 	brsf |= hf->status ? HFP_HF_STATUS : 0;
 	brsf |= hf->control ? HFP_HF_CONTROL : 0;
+	brsf |= hf->codec ? HFP_HF_CODEC : 0;
 
 	return brsf;
 }
@@ -2500,6 +3022,7 @@ static struct hfp_ag *hfp_int2brsf(int brsf, struct hfp_ag *ag)
 	ag->status = brsf & HFP_AG_STATUS ? 1 : 0;
 	ag->control = brsf & HFP_AG_CONTROL ? 1 : 0;
 	ag->errors = brsf & HFP_AG_ERRORS ? 1 : 0;
+	ag->codec = brsf & HFP_AG_CODEC ? 1 : 0;
 
 	return ag;
 }
@@ -2518,6 +3041,57 @@ static int hfp_send_brsf(struct hfp_pvt *hfp, struct hfp_hf *brsf)
 	char cmd[32];
 	snprintf(cmd, sizeof(cmd), "AT+BRSF=%d\r", hfp_brsf2int(brsf));
 	return rfcomm_write(hfp->rsock, cmd);
+}
+
+/*!
+ * \brief Send our list of available codecs (AT+BAC).
+ * \param hfp an hfp_pvt struct
+ *
+ * Announce the codecs we support to the AG, in order of preference. We list
+ * mSBC (2) first so wideband audio is preferred, then CVSD (1) as fallback.
+ *
+ * \retval 0 on success
+ * \retval -1 on error
+ */
+static int hfp_send_bac(struct hfp_pvt *hfp)
+{
+	return rfcomm_write(hfp->rsock, "AT+BAC=1,2\r");
+}
+
+/*!
+ * \brief Confirm the codec selected by the AG (AT+BCS).
+ * \param hfp an hfp_pvt struct
+ * \param codec the codec id the AG selected via +BCS
+ *
+ * \retval 0 on success
+ * \retval -1 on error
+ */
+static int hfp_send_bcs(struct hfp_pvt *hfp, int codec)
+{
+	char cmd[32];
+	snprintf(cmd, sizeof(cmd), "AT+BCS=%d\r", codec);
+	return rfcomm_write(hfp->rsock, cmd);
+}
+
+/*!
+ * \brief Parse a +BCS codec selection from the AG.
+ * \param hfp an hfp_pvt struct
+ * \param buf the buffer to parse (null terminated)
+ * \retval -1 on parse error
+ * \retval other the codec id the AG selected
+ *
+ * Example: \verbatim +BCS:2 \endverbatim
+ */
+static int hfp_parse_bcs(struct hfp_pvt *hfp, char *buf)
+{
+	int codec;
+
+	if (!sscanf(buf, "+BCS:%30d", &codec)) {
+		ast_debug(1, "[%s] error parsing BCS '%s'\n", hfp->owner->id, buf);
+		return -1;
+	}
+
+	return codec;
 }
 
 /*!
@@ -3189,6 +3763,41 @@ static sdp_session_t *sdp_register(void)
 */
 
 /*!
+ * \brief Handle a +BCS codec-selection request from the AG.
+ * \param pvt a mbl_pvt structure
+ * \param buf a null terminated buffer containing an AT message
+ * \retval 0 success
+ * \retval -1 error
+ *
+ * +BCS is sent unsolicited by the AG during codec connection setup (e.g. when
+ * a call is being established). We record the selected codec and confirm it
+ * with AT+BCS=<codec>; the AG then establishes the Synchronous Connection with
+ * the matching air mode (transparent for mSBC, which we configure on the
+ * accepted SCO socket).
+ */
+static int handle_response_bcs(struct mbl_pvt *pvt, char *buf)
+{
+	int codec;
+
+	if ((codec = hfp_parse_bcs(pvt->hfp, buf)) < 0) {
+		ast_debug(1, "[%s] error parsing BCS\n", pvt->id);
+		return -1;
+	}
+
+	ast_debug(1, "[%s] AG selected codec %d (%s)\n", pvt->id, codec,
+		codec == HFP_CODEC_MSBC ? "mSBC" : codec == HFP_CODEC_CVSD ? "CVSD" : "unknown");
+
+	pvt->hfp->codec = codec;
+
+	if (hfp_send_bcs(pvt->hfp, codec) || msg_queue_push(pvt, AT_OK, AT_BCS)) {
+		ast_debug(1, "[%s] error confirming codec selection\n", pvt->id);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*!
  * \brief Handle the BRSF response.
  * \param pvt a mbl_pvt structure
  * \param buf a null terminated buffer containing an AT message
@@ -3281,6 +3890,23 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 		/* initialization stuff */
 		case AT_BRSF:
 			ast_debug(1, "[%s] BSRF sent successfully\n", pvt->id);
+
+			/* If both we and the AG support codec negotiation (HFP 1.6),
+			 * announce our available codecs with AT+BAC before continuing
+			 * the service level connection. This enables mSBC wideband audio. */
+			if (hfp_our_brsf.codec && pvt->hfp->brsf.codec) {
+				if (hfp_send_bac(pvt->hfp) || msg_queue_push(pvt, AT_OK, AT_BAC)) {
+					ast_debug(1, "[%s] error sending BAC\n", pvt->id);
+					goto e_return;
+				}
+				break;
+			}
+			/* fall through to the post-BAC step when codec negotiation
+			 * is not supported */
+		case AT_BAC:
+			if (entry->response_to == AT_BAC) {
+				ast_debug(1, "[%s] BAC sent successfully\n", pvt->id);
+			}
 
 			/* If this is a blackberry do CMER now, otherwise
 			 * continue with CIND as normal. */
@@ -3415,6 +4041,9 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 			break;
 		case AT_CUSD:
 			ast_debug(1, "[%s] CUSD code sent successfully\n", pvt->id);
+			break;
+		case AT_BCS:
+			ast_debug(1, "[%s] codec confirmed (AT+BCS=%d); AG will now set up audio\n", pvt->id, pvt->hfp->codec);
 			break;
 		case AT_UNKNOWN:
 		default:
@@ -3945,6 +4574,14 @@ static void *do_monitor_phone(void *data)
 		case AT_CIND:
 			ast_mutex_lock(&pvt->lock);
 			if (handle_response_cind(pvt, buf)) {
+				ast_mutex_unlock(&pvt->lock);
+				goto e_cleanup;
+			}
+			ast_mutex_unlock(&pvt->lock);
+			break;
+		case AT_BCS:
+			ast_mutex_lock(&pvt->lock);
+			if (handle_response_bcs(pvt, buf)) {
 				ast_mutex_unlock(&pvt->lock);
 				goto e_cleanup;
 			}
@@ -4748,6 +5385,12 @@ static int unload_module(void)
 			ast_free(pvt->hfp);
 		}
 
+		if (pvt->msbc_inited) {
+			sbc_finish(&pvt->msbc_enc);
+			sbc_finish(&pvt->msbc_dec);
+			pvt->msbc_inited = 0;
+		}
+
 		ast_smoother_free(pvt->bt_out_smoother);
 		ast_smoother_free(pvt->bt_in_smoother);
 		ast_dsp_free(pvt->dsp);
@@ -4785,6 +5428,8 @@ static int load_module(void)
 	}
 
 	ast_format_cap_append(mbl_tech.capabilities, DEVICE_FRAME_FORMAT, 0);
+	/* slin16 is used when an HFP call negotiates the mSBC wideband codec. */
+	ast_format_cap_append(mbl_tech.capabilities, MSBC_FRAME_FORMAT, 0);
 	/* Check if we have Bluetooth, no point loading otherwise... */
 	dev_id = hci_get_route(NULL);
 
