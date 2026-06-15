@@ -5,26 +5,63 @@
 > This is a fork of Asterisk that adds **mSBC (HFP wideband, 16 kHz) audio
 > support to `chan_mobile`**. Stock `chan_mobile` only does narrowband CVSD
 > (8 kHz); this fork negotiates and runs the mSBC codec over HFP, roughly
-> doubling call-audio bandwidth when talking to a Bluetooth phone.
+> doubling call-audio bandwidth when bridging a Bluetooth phone's cellular
+> calls into Asterisk.
 >
-> **What changed** (vs upstream):
-> - `addons/chan_mobile.c` — HFP codec negotiation (BRSF / `AT+BAC` / `+BCS`),
->   `BT_VOICE` transparent air mode + `BT_DEFER_SETUP` on the SCO link, libsbc
->   mSBC encode/decode with H2 framing, a slin16-native channel, TX paced to
->   the eSCO air clock (fixed-size non-blocking SCO writes), and RX clock-drift
->   compensation with silence-aware correction.
-> - `addons/Makefile` — links `chan_mobile` against `libsbc`.
+> ### What changed (vs upstream)
 >
-> **Requirements:** `libsbc` (`libsbc-dev` on Debian/Ubuntu). The phone must do
-> HFP codec negotiation (advertise `+BCS`); not all handsets do.
+> - **`addons/chan_mobile.c`**
+>   - HFP codec negotiation: advertise codec support in BRSF, send
+>     `AT+BAC=1,2`, and handle the AG's `+BCS` to select mSBC (codec 2) or
+>     fall back to CVSD (codec 1).
+>   - SCO accept side: `BT_DEFER_SETUP` on the listener plus `BT_VOICE`
+>     transparent air mode for mSBC links.
+>   - libsbc mSBC encode/decode with H2 framing; the channel runs natively at
+>     `slin16` and the CVSD path resamples to/from 16 kHz so the channel format
+>     is constant for the call.
+>   - TX is paced to the eSCO air clock: encoded bytes are queued and written
+>     to the SCO socket in fixed air-frame-sized packets (size learned from the
+>     RX packet length), flushed non-blocking so the kernel USB-isochronous
+>     clock sets the rate instead of the bursty PBX write thread.
+>   - RX wall-clock drift compensation with silence-aware drop/repeat, so the
+>     unavoidable SCO-vs-system clock correction lands in speech gaps.
+> - **`addons/Makefile`** — links `chan_mobile` against `libsbc` (`-lsbc`).
 >
-> **Build:** install `libsbc-dev`, then the usual
-> `./configure && make && make install`. `chan_mobile` picks mSBC automatically
-> when the phone supports it and falls back to CVSD otherwise.
+> ### Requirements
 >
-> Tested on Ubuntu 24.04 / Asterisk 20.6 with a CSR USB adapter and a Huawei
-> handset (bidirectional wideband call). This fork is provided as-is and is not
-> affiliated with the Asterisk project.
+> - `libsbc` / `libsbc-dev` (Debian/Ubuntu).
+> - A USB Bluetooth adapter whose controller supports **transparent (mSBC)
+>   eSCO** — check `hciconfig <hci> features` for `<transparent SCO>`.
+> - A phone that performs **HFP codec negotiation** (sends `+BCS`). This is the
+>   real compatibility gate: a phone that never sends `+BCS` will only ever get
+>   CVSD (or fail to set up SCO), no matter the adapter. (For example, a Redmi
+>   9A in testing never negotiated mSBC; a Huawei Mate60 Pro does.)
+>
+> ### Tested configuration
+>
+> | Component | Detail |
+> | --- | --- |
+> | Host / OS | Mac mini (x86_64), Ubuntu 24.04 |
+> | Asterisk | 20.6 (addons / `chan_mobile`) |
+> | USB Bluetooth adapter | **CSR8510 A10** dongle — USB ID `0a12:0001` (Cambridge Silicon Radio); HCI SCO MTU 64 |
+> | Phone | **Huawei Mate60 Pro** (HFP-AG, negotiates mSBC via `+BCS`) |
+> | Result | Bidirectional 16 kHz wideband call, SIP leg at G.722 |
+>
+> ### Build
+>
+> ```sh
+> sudo apt-get install libsbc-dev            # Debian/Ubuntu
+> ./configure
+> make
+> sudo make install
+> ```
+>
+> `chan_mobile` selects mSBC automatically when the phone supports it and falls
+> back to CVSD otherwise. Configure the device in `chan_mobile.conf` as usual
+> (the adapter `address` and the phone `address` / HFP-AG RFCOMM `port`); no
+> mSBC-specific configuration is required.
+>
+> This fork is provided as-is and is not affiliated with the Asterisk project.
 
 ```
 By Mark Spencer <markster@digium.com> and the Asterisk.org developer community.
