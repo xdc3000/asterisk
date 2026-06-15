@@ -1,5 +1,31 @@
 # The Asterisk(R) Open Source PBX
 
+> ## Fork note: chan_mobile mSBC wideband audio
+>
+> This is a fork of Asterisk that adds **mSBC (HFP wideband, 16 kHz) audio
+> support to `chan_mobile`**. Stock `chan_mobile` only does narrowband CVSD
+> (8 kHz); this fork negotiates and runs the mSBC codec over HFP, roughly
+> doubling call-audio bandwidth when talking to a Bluetooth phone.
+>
+> **What changed** (vs upstream):
+> - `addons/chan_mobile.c` — HFP codec negotiation (BRSF / `AT+BAC` / `+BCS`),
+>   `BT_VOICE` transparent air mode + `BT_DEFER_SETUP` on the SCO link, libsbc
+>   mSBC encode/decode with H2 framing, a slin16-native channel, TX paced to
+>   the eSCO air clock (fixed-size non-blocking SCO writes), and RX clock-drift
+>   compensation with silence-aware correction.
+> - `addons/Makefile` — links `chan_mobile` against `libsbc`.
+>
+> **Requirements:** `libsbc` (`libsbc-dev` on Debian/Ubuntu). The phone must do
+> HFP codec negotiation (advertise `+BCS`); not all handsets do.
+>
+> **Build:** install `libsbc-dev`, then the usual
+> `./configure && make && make install`. `chan_mobile` picks mSBC automatically
+> when the phone supports it and falls back to CVSD otherwise.
+>
+> Tested on Ubuntu 24.04 / Asterisk 20.6 with a CSR USB adapter and a Huawei
+> handset (bidirectional wideband call). This fork is provided as-is and is not
+> affiliated with the Asterisk project.
+
 ```
 By Mark Spencer <markster@digium.com> and the Asterisk.org developer community.
 Copyright (C) 2001-2025 Sangoma Technologies Corporation and other copyright holders.
